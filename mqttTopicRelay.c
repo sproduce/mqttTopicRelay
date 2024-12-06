@@ -7,11 +7,20 @@
 #include <malloc.h>
 
 
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <syslog.h>
+
 
 int globali = 10;
 
+int sqlRc;
+
 sqlite3 *db;
 char *err_msg = 0;
+char configPath[200];
 struct mosquitto *mosq;
 
 
@@ -29,11 +38,40 @@ struct {
 
 
 
+
+struct mqtt_config{
+    const char* host;
+    int port;
+    const char* login;
+    const char* passwd;
+} mqttConfig;
+
+
+
+int getConfig(void *mConfig, int argc, char **argv, 
+                    char **azColName) {
+    struct mqtt_config *mConf = (struct mqtt_config *)mConfig;
+    for (int i = 0; i < argc; i++){
+        if (argv[i]){
+            if (strcmp(azColName[i],"mqttHost") == 0){mConf->host = strdup(argv[i]);}
+            if (strcmp(azColName[i],"mqttPort") == 0){mConf->port = atoi(argv[i]);}
+            if (strcmp(azColName[i],"mqttLogin") == 0){mConf->login = strdup(argv[i]);}
+            if (strcmp(azColName[i],"mqttPasswd") == 0){mConf->passwd = strdup(argv[i]);}
+        }
+        
+    }
+
+
+
+}
+
+
+
 int getTopics(void *NotUsed, int argc, char **argv, 
                     char **azColName) {
     stopics.topics[stopics.count].name = strdup(argv[1]);
     stopics.topics[stopics.count].id = atoi(argv[0]);
-    printf("id = %i\nname = %s\n", stopics.topics[stopics.count].id, stopics.topics[stopics.count].name);
+    //printf("id = %i\nname = %s\n", stopics.topics[stopics.count].id, stopics.topics[stopics.count].name);
     stopics.count++;
     return 0;
 }
@@ -46,11 +84,11 @@ void subscribeFromDb(struct mosquitto *mosq) {
 }
 
 
-int getSendTopic(void *NotUsed, int argc, char **argv, 
+int getSendTopic(void *mosq, int argc, char **argv, 
                     char **azColName) {
+    struct mosquitto *msqt = (struct mosquitto *)mosq;    
     //stopics.topics[stopics.count].name = strdup(argv[1]);
-        printf("Topic: %s, data: %i\n",argv[0],atoi(argv[1]));
-        mosquitto_publish(mosq, NULL, argv[0], strlen(argv[1]), argv[1], 2, false);
+    mosquitto_publish(msqt, NULL, argv[0], strlen(argv[1]), argv[1], 2, false);
     return 0;
 }
 
@@ -61,12 +99,10 @@ void mConnect(struct mosquitto *mosq, void *obj, int rc)
 {
     if (rc != MOSQ_ERR_SUCCESS){
         mosquitto_disconnect(mosq);
-        printf("Login Passwd ERROR\n");
-        printf("MQTT DISCONNECT ...... !!!\n");
+        //printf("Login Passwd ERROR\n");
+        //printf("MQTT DISCONNECT ...... !!!\n");
     } else {
-        printf("Mosquitto connect ...... !!!\n");
-        subscribeFromDb(mosq);
-        //mosquitto_subscribe(mosq, NULL, "test" , 1);
+        //printf("Mosquitto connect ...... !!!\n");
         subscribeFromDb(mosq);
     }
 
@@ -74,11 +110,10 @@ void mConnect(struct mosquitto *mosq, void *obj, int rc)
 
 
 
-void sendMessage(unsigned int stopicId, int value) {
-    printf("Topic Id: %i  Value: %i\n", stopicId, value);
+void sendMessage(struct mosquitto *msq, unsigned int stopicId, int value) {
     sprintf(stringSql,"select topic, value from ptopic where stopic_id=%i and svalue=%i",stopicId, value);
-    int sqlRc = sqlite3_exec(db, stringSql, getSendTopic, 0, &err_msg);
-    //printf("%s\n", stringSql);
+    int sqlRc = sqlite3_exec(db, stringSql, getSendTopic, msq, &err_msg);
+
 }
 
 
@@ -87,7 +122,7 @@ void mMessage(struct mosquitto *mosq, void *obj, const struct mosquitto_message 
 {
     for(int i = 0; i < stopics.count; i++) {
         if (!strcmp(stopics.topics[i].name, msg->topic)) {
-            sendMessage(stopics.topics[i].id, atoi(msg->payload));
+            sendMessage(mosq, stopics.topics[i].id, atoi(msg->payload));
             //printf("Message: %i \n", stopics.topics[i].id);        
         }
     }
@@ -95,23 +130,14 @@ void mMessage(struct mosquitto *mosq, void *obj, const struct mosquitto_message 
 
 
 
-int main(void) {
 
-    int rc;
-    mosquitto_lib_init();
-    mosq = mosquitto_new(NULL, true, NULL);
-    mosquitto_connect_callback_set(mosq, mConnect);
-    mosquitto_message_callback_set(mosq, mMessage);
-
-    rc = mosquitto_username_pw_set(mosq, "volodia", "123456");
-    rc = mosquitto_connect(mosq, "test.mqtt.plainiot.com", 1883, 60);
+int newMain()
+{
+  int rc;
 
 
 
-
-
-
-    int sqlRc = sqlite3_open("./test.db", &db);
+    sqlRc = sqlite3_open(configPath, &db);
 
     if (sqlRc != SQLITE_OK) {
         
@@ -120,6 +146,22 @@ int main(void) {
         
         return 1;
     }
+
+    char *sqlConfig = "SELECT * FROM config";
+    sqlRc = sqlite3_exec(db, sqlConfig, getConfig, &mqttConfig, &err_msg);
+
+
+
+
+    mosquitto_lib_init();
+    mosq = mosquitto_new(NULL, true, NULL);
+    mosquitto_connect_callback_set(mosq, mConnect);
+    mosquitto_message_callback_set(mosq, mMessage);
+
+    rc = mosquitto_username_pw_set(mosq, mqttConfig.login, mqttConfig.passwd);
+    rc = mosquitto_connect(mosq, mqttConfig.host, mqttConfig.port, 60);
+
+ 
 
     char *sql = "SELECT id,topic FROM stopic limit 99";
     sqlRc = sqlite3_exec(db, sql, getTopics, NULL, &err_msg);
@@ -136,15 +178,89 @@ int main(void) {
     } 
 
     
- //   printf("%s\n", sqlite3_libversion()); 
+ 
     mosquitto_loop_start(mosq);
     //mosquitto_loop_forever(mosq, -1, 1);
-    printf("count topic = %i\n",stopics.count);
+    //printf("count topic = %i\n",stopics.count);
     for(;;) {
         //mosquitto_publish(mosq, NULL, "sinh/sinh", 1, "100", 2, false);
         //sleep(3);
     }
 
+
+return 0;
+
+}
+
+
+
+
+
+
+
+static void start_daemon()
+{
+    pid_t pid;
+    
+    pid = fork();
+    
+    if (pid < 0)
+        exit(EXIT_FAILURE);
+    
+    if (pid > 0)
+        exit(EXIT_SUCCESS);
+    
+    /* On success: The child process becomes session leader */
+    if (setsid() < 0)
+        exit(EXIT_FAILURE);
+    
+    /* Catch, ignore and handle signals */
+    /*TODO: Implement a working signal handler */
+    signal(SIGCHLD, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
+    
+    /* Fork off for the second time*/
+    pid = fork();
+    
+    /* An error occurred */
+    if (pid < 0)
+        exit(EXIT_FAILURE);
+    
+    /* Success: Let the parent terminate */
+    if (pid > 0)
+        exit(EXIT_SUCCESS);
+    
+    /* Set new file permissions */
+    umask(0);
+    
+    /* Change the working directory to the root directory */
+    /* or another appropriated directory */
+    chdir("/");
+    
+    /* Close all open file descriptors */
+    int x;
+    for (x = sysconf(_SC_OPEN_MAX); x>=0; x--)
+    {
+        close (x);
+    }
+    
+    newMain();
+}
+
+
+
+
+
+
+
+
+
+
+
+int main(int argc, char* argv[]) {
+    strcat(getcwd(configPath, 200),"/mqttTopic.db");
+    printf("%s\n",configPath);
+    start_daemon();
 
     return 0;
 }
